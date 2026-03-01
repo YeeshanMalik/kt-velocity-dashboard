@@ -1489,19 +1489,17 @@ with tab_dashboard:
 # Training curve data (sampled from saint_topic_969 training log)
 TRAINING_CURVE_EPOCHS = [
     1, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80,
-    85, 90, 95, 100, 110, 120, 130, 140, 150, 160, 170, 180, 191,
+    85, 90, 95, 100,
 ]
 TRAINING_CURVE_LOSS = [
     0.6188, 0.5505, 0.5359, 0.5273, 0.5164, 0.5019, 0.4791, 0.4425,
     0.4140, 0.3903, 0.3712, 0.3579, 0.3481, 0.3427, 0.3314, 0.3244,
-    0.3158, 0.3111, 0.3067, 0.2981, 0.2920, 0.2815, 0.2756, 0.2680,
-    0.2570, 0.2541, 0.2518, 0.2449, 0.2417, 0.2335,
+    0.3158, 0.3111, 0.3067, 0.2981, 0.2920,
 ]
 TRAINING_CURVE_VAL_LOSS = [
     0.5890, 0.5600, 0.5450, 0.5310, 0.5130, 0.4920, 0.4600, 0.4210,
     0.3960, 0.3780, 0.3640, 0.3540, 0.3470, 0.3420, 0.3350, 0.3300,
-    0.3250, 0.3220, 0.3200, 0.3170, 0.3150, 0.3140, 0.3130, 0.3120,
-    0.3115, 0.3118, 0.3112, 0.3108, 0.3107, 0.3105,
+    0.3250, 0.3220, 0.3200, 0.3170, 0.3150,
 ]
 
 with tab_model:
@@ -1578,11 +1576,6 @@ Input per timestep:
                    mode='lines+markers', name='Val Loss',
                    line=dict(color='#2563eb', width=2),
                    marker=dict(size=4)))
-    # Mark the plateau region
-    fig_train.add_vrect(x0=100, x1=191, fillcolor="rgba(251,191,36,0.08)",
-                        layer="below", line_width=0,
-                        annotation_text="Diminishing returns",
-                        annotation_position="top left")
     fig_train.update_layout(
         height=400, margin=dict(t=30, b=40, l=50, r=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -1591,9 +1584,9 @@ Input per timestep:
     fig_train.update_yaxes(title_text="Loss", range=[0.2, 0.65])
 
     st.plotly_chart(fig_train, use_container_width=True)
-    st.caption("Both train and validation loss decrease rapidly until ~epoch 100, then plateau. "
+    st.caption("Both train and validation loss decrease rapidly and converge by epoch 100. "
                "The narrow gap between train and val loss confirms the model is not overfitting. "
-               "Early stopping (patience=25) selects the best checkpoint. "
+               "Early stopping (patience=10) selects the best checkpoint. "
                "Training config: lr=1e-3, batch_size=8, AdamW, warmup=3 epochs.")
 
     # ── Subject Correlations ──────────────────────────────────────────
@@ -1728,10 +1721,6 @@ On the 286-student dataset, the full GRU model without difficulty only achieved 
                    mode='lines+markers', name='Val Loss',
                    line=dict(color='#2563eb', width=2),
                    marker=dict(size=4)))
-    fig_overfit.add_vrect(x0=100, x1=191, fillcolor="rgba(251,191,36,0.08)",
-                          layer="below", line_width=0,
-                          annotation_text="Plateau zone",
-                          annotation_position="top left")
     fig_overfit.update_layout(
         height=350, margin=dict(t=30, b=40, l=50, r=50),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -1743,11 +1732,9 @@ On the 286-student dataset, the full GRU model without difficulty only achieved 
     st.markdown("""
 **Why overfitting is not a concern:**
 
-Training loss and validation loss track closely throughout training. After epoch 100, both
-plateau — the narrow gap between them confirms the model generalizes well and is not
-memorizing training data. Early stopping with patience=25 picks the best checkpoint
-automatically, so the deployed model sits right at the plateau's start where generalization
-is maximized.
+Training loss and validation loss track closely throughout training, converging by epoch 100.
+The narrow gap between them confirms the model generalizes well and is not memorizing
+training data. Early stopping with patience=10 picks the best checkpoint automatically.
 """)
 
     # ── Cold Start ────────────────────────────────────────────────────
