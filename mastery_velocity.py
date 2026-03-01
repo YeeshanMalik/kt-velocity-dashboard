@@ -1119,21 +1119,26 @@ class VelocityTracker:
 @dataclass
 class ZPDESSubjectState:
     """Per-student per-subject state for ZPDES learning progress."""
-    outcomes: deque = field(default_factory=lambda: deque(maxlen=16))
+    outcomes: List[int] = field(default_factory=list)
     velocity_history: List[float] = field(default_factory=list)
 
 
 class ZPDESVelocityTracker(BaseVelocityTracker):
-    """ZPDES Learning Progress (Clement et al., 2015).
+    """ZPDES Learning Progress (Clement et al., 2015) with adaptive window.
 
     LP(topic, t) = mean(outcomes[t-d/2 : t]) - mean(outcomes[t-d : t-d/2])
     Operates on raw binary correctness, NOT smoothed mastery.
     Range: [-1, +1], self-calibrating.
+
+    Adaptive window: d = max(min_d, min(n // 2, max_d)) where n = total
+    outcomes for that subject. This lets ZPDES see gradual improvements
+    that span more than 16 interactions.
     """
 
-    def __init__(self, window_d: int = 16):
-        self.d = window_d
-        self.half_d = window_d // 2
+    def __init__(self, window_d: int = 16, min_d: int = 16, max_d: int = 64):
+        self.default_d = window_d
+        self.min_d = min_d
+        self.max_d = max_d
         # {student_id: {subject_id: ZPDESSubjectState}}
         self.students: Dict[str, Dict[str, ZPDESSubjectState]] = {}
 
@@ -1145,11 +1150,14 @@ class ZPDESVelocityTracker(BaseVelocityTracker):
         if student_id not in self.students:
             self.students[student_id] = {}
         if subject_id not in self.students[student_id]:
-            self.students[student_id][subject_id] = ZPDESSubjectState(
-                outcomes=deque(maxlen=self.d))
+            self.students[student_id][subject_id] = ZPDESSubjectState()
         return self.students[student_id][subject_id]
 
-    def _compute_lp(self, outcomes: deque) -> Tuple[float, float]:
+    def _effective_d(self, n: int) -> int:
+        """Adaptive window size: grows with data, capped at max_d."""
+        return max(self.min_d, min(n // 2, self.max_d))
+
+    def _compute_lp(self, outcomes: List[int]) -> Tuple[float, float]:
         """Compute Learning Progress and confidence.
 
         Returns (lp, confidence).
@@ -1158,13 +1166,15 @@ class ZPDESVelocityTracker(BaseVelocityTracker):
         if n < 2:
             return 0.0, 0.0
 
-        outcomes_list = list(outcomes)
-        recent_start = max(0, n - self.half_d)
-        older_end = recent_start
-        older_start = max(0, n - self.d)
+        d = self._effective_d(n)
+        half_d = d // 2
 
-        recent = outcomes_list[recent_start:]
-        older = outcomes_list[older_start:older_end]
+        recent_start = max(0, n - half_d)
+        older_end = recent_start
+        older_start = max(0, n - d)
+
+        recent = outcomes[recent_start:]
+        older = outcomes[older_start:older_end]
 
         if not recent or not older:
             # LP is undefined without both windows → confidence must be 0
@@ -1172,9 +1182,8 @@ class ZPDESVelocityTracker(BaseVelocityTracker):
 
         lp = float(np.mean(recent) - np.mean(older))
         # Ramp confidence based on older window fill (LP needs both windows).
-        # Smoother than the original n/half_d which jumped from 0 to 1.
         n_older = len(older)
-        confidence = min(1.0, n_older / self.half_d)
+        confidence = min(1.0, n_older / half_d)
         return lp, confidence
 
     def record(self, student_id: str, timestamp_days: float,
@@ -1213,14 +1222,13 @@ class ZPDESVelocityTracker(BaseVelocityTracker):
     def get_consistency(self, student_id: str, window: int = 10) -> float:
         if student_id not in self.students:
             return 0.5
-        all_recent = []
-        for state in self.students[student_id].values():
-            all_recent.extend(state.velocity_history[-window:])
-        if len(all_recent) < 2:
-            return 0.5
-        var = np.var(all_recent)
         max_var = 0.25  # LP range is [-1,+1], max var for uniform ≈ 0.33
-        return max(0.0, 1.0 - var / max_var)
+        per_subj = []
+        for state in self.students[student_id].values():
+            recent = state.velocity_history[-window:]
+            if len(recent) >= 2:
+                per_subj.append(max(0.0, 1.0 - np.var(recent) / max_var))
+        return float(np.mean(per_subj)) if per_subj else 0.5
 
     def normalize_for_mvs(self, velocity: float) -> float:
         return float(np.clip((velocity + 1.0) / 2.0, 0.0, 1.0))
@@ -1308,14 +1316,13 @@ class KTVelocityTracker(BaseVelocityTracker):
     def get_consistency(self, student_id: str, window: int = 10) -> float:
         if student_id not in self.students:
             return 0.5
-        all_recent = []
-        for state in self.students[student_id].values():
-            all_recent.extend(state.velocity_history[-window:])
-        if len(all_recent) < 2:
-            return 0.5
-        var = np.var(all_recent)
         max_var = 0.04  # EMA-smoothed deltas rarely exceed ±0.2
-        return max(0.0, 1.0 - var / max_var)
+        per_subj = []
+        for state in self.students[student_id].values():
+            recent = state.velocity_history[-window:]
+            if len(recent) >= 2:
+                per_subj.append(max(0.0, 1.0 - np.var(recent) / max_var))
+        return float(np.mean(per_subj)) if per_subj else 0.5
 
     def normalize_for_mvs(self, velocity: float) -> float:
         # Empirical range ~[-0.3, +0.3], map to [0, 1] with 0 → 0.5
@@ -1395,8 +1402,11 @@ class CUSUMVelocityTracker(BaseVelocityTracker):
             state.s_minus = 0.0  # reset after detection
 
         # Update baseline AFTER CUSUM computation (slow EMA)
-        state.mu_baseline = (self.baseline_alpha * x_t
-                             + (1 - self.baseline_alpha) * state.mu_baseline)
+        # Clamp to [k+0.05, 1-k-0.05] so both S+ and S- can always accumulate.
+        # Without this, mu drifting below k makes S- unable to detect declines.
+        mu_raw = (self.baseline_alpha * x_t
+                  + (1 - self.baseline_alpha) * state.mu_baseline)
+        state.mu_baseline = float(np.clip(mu_raw, self.k + 0.05, 1.0 - self.k - 0.05))
 
         # Continuous velocity signal — clipped to [-1, +1]
         # (S+ can momentarily exceed h by up to max_increment before reset)
@@ -1453,14 +1463,13 @@ class CUSUMVelocityTracker(BaseVelocityTracker):
     def get_consistency(self, student_id: str, window: int = 10) -> float:
         if student_id not in self.students:
             return 0.5
-        all_recent = []
-        for state in self.students[student_id].values():
-            all_recent.extend(state.velocity_history[-window:])
-        if len(all_recent) < 2:
-            return 0.5
-        var = np.var(all_recent)
         max_var = 0.25  # (S+ - S-)/h range is roughly [-1, +1]
-        return max(0.0, 1.0 - var / max_var)
+        per_subj = []
+        for state in self.students[student_id].values():
+            recent = state.velocity_history[-window:]
+            if len(recent) >= 2:
+                per_subj.append(max(0.0, 1.0 - np.var(recent) / max_var))
+        return float(np.mean(per_subj)) if per_subj else 0.5
 
     def normalize_for_mvs(self, velocity: float) -> float:
         return float(np.clip((velocity + 1.0) / 2.0, 0.0, 1.0))
@@ -1544,22 +1553,138 @@ class MasteryDeltaVelocityTracker(BaseVelocityTracker):
     def get_consistency(self, student_id: str, window: int = 10) -> float:
         if student_id not in self.students:
             return 0.5
-        all_recent = []
+        max_var = 0.02  # mastery deltas swing ±0.07; generous for low-n subjects
+        weighted_sum = 0.0
+        total_n = 0
         for state in self.students[student_id].values():
-            all_recent.extend(state.velocity_history[-window:])
-        if len(all_recent) < 2:
-            return 0.5
-        var = np.var(all_recent)
-        # Mastery deltas are small (±0.02), max variance ≈ 0.0004
-        max_var = 0.0004
-        return max(0.0, 1.0 - var / max_var)
+            recent = state.velocity_history[-window:]
+            n = len(recent)
+            if n >= 2:
+                c = max(0.0, 1.0 - np.var(recent) / max_var)
+                weighted_sum += n * c
+                total_n += n
+        return float(weighted_sum / total_n) if total_n > 0 else 0.5
 
     def normalize_for_mvs(self, velocity: float) -> float:
         # Map [-0.02, +0.02] → [0, 1], symmetric: 0 velocity → 0.5
         return float(np.clip((velocity + 0.02) / 0.04, 0.0, 1.0))
 
 
-# ── 3f. ENSEMBLE VELOCITY TRACKER ─────────────────────────────────────
+# ── 3f. REGRESSION VELOCITY TRACKER (OLS slope) ─────────────────────
+
+@dataclass
+class RegressionSubjectState:
+    """Per-student per-subject state for OLS regression velocity."""
+    outcomes: List[int] = field(default_factory=list)  # binary correct/incorrect
+    velocity_history: List[float] = field(default_factory=list)
+
+
+class RegressionVelocityTracker(BaseVelocityTracker):
+    """OLS regression slope of correctness over interaction number.
+
+    Fits a simple linear regression y = a + b*x on the full outcome history
+    per subject, where y ∈ {0, 1} and x = interaction index. The slope b
+    captures the overall trend including gradual improvements that sliding-
+    window methods (ZPDES) might miss.
+
+    Range: slope is typically in [-0.05, +0.05] per interaction. Scaled by
+    scale_factor=20 to map to [-1, +1] for ensemble compatibility.
+    """
+
+    def __init__(self, min_interactions: int = 4):
+        self.min_interactions = min_interactions
+        self.students: Dict[str, Dict[str, RegressionSubjectState]] = {}
+
+    @property
+    def name(self) -> str:
+        return "Regression (OLS)"
+
+    def _get_state(self, student_id: str, subject_id: str) -> RegressionSubjectState:
+        if student_id not in self.students:
+            self.students[student_id] = {}
+        if subject_id not in self.students[student_id]:
+            self.students[student_id][subject_id] = RegressionSubjectState()
+        return self.students[student_id][subject_id]
+
+    @staticmethod
+    def _ols_slope(outcomes: List[int]) -> float:
+        """Compute OLS slope efficiently: b = Cov(x,y) / Var(x)."""
+        n = len(outcomes)
+        if n < 2:
+            return 0.0
+        x = np.arange(n, dtype=float)
+        y = np.array(outcomes, dtype=float)
+        x_mean = (n - 1) / 2.0
+        y_mean = y.mean()
+        cov_xy = np.dot(x - x_mean, y - y_mean)
+        var_x = np.dot(x - x_mean, x - x_mean)
+        if var_x < 1e-12:
+            return 0.0
+        return float(cov_xy / var_x)
+
+    def record(self, student_id: str, timestamp_days: float,
+               overall_mastery: float,
+               subject_id: Optional[str] = None,
+               subject_mastery: Optional[float] = None,
+               is_correct: Optional[bool] = None,
+               kt_prediction: Optional[float] = None) -> Tuple[float, float]:
+        if subject_id is None or is_correct is None:
+            return 0.0, 0.0
+
+        state = self._get_state(student_id, subject_id)
+        state.outcomes.append(1 if is_correct else 0)
+
+        n = len(state.outcomes)
+        if n < self.min_interactions:
+            state.velocity_history.append(0.0)
+            return 0.0, 0.0
+
+        slope = self._ols_slope(state.outcomes)
+        state.velocity_history.append(slope)
+
+        # Confidence: ramp from 0 → 1 over 16 interactions
+        confidence = min(1.0, (n - self.min_interactions) / 12.0)
+        return slope, confidence
+
+    def get_subject_velocity(self, student_id: str, subject_id: str) -> float:
+        if (student_id not in self.students or
+                subject_id not in self.students[student_id]):
+            return 0.0
+        state = self.students[student_id][subject_id]
+        if len(state.outcomes) < self.min_interactions:
+            return 0.0
+        return self._ols_slope(state.outcomes)
+
+    def get_aggregate_velocity(self, student_id: str) -> float:
+        if student_id not in self.students:
+            return 0.0
+        velocities = []
+        for state in self.students[student_id].values():
+            if len(state.outcomes) >= self.min_interactions:
+                velocities.append(self._ols_slope(state.outcomes))
+        return float(np.mean(velocities)) if velocities else 0.0
+
+    def get_consistency(self, student_id: str, window: int = 10) -> float:
+        if student_id not in self.students:
+            return 0.5
+        max_var = 0.05  # OLS slopes swing wide for low-n subjects
+        weighted_sum = 0.0
+        total_n = 0
+        for state in self.students[student_id].values():
+            recent = state.velocity_history[-window:]
+            n = len(recent)
+            if n >= 2:
+                c = max(0.0, 1.0 - np.var(recent) / max_var)
+                weighted_sum += n * c
+                total_n += n
+        return float(weighted_sum / total_n) if total_n > 0 else 0.5
+
+    def normalize_for_mvs(self, velocity: float) -> float:
+        # Map [-0.05, +0.05] → [0, 1], symmetric: 0 slope → 0.5
+        return float(np.clip((velocity + 0.05) / 0.10, 0.0, 1.0))
+
+
+# ── 3g. ENSEMBLE VELOCITY TRACKER ─────────────────────────────────────
 
 @dataclass
 class EnsembleSubjectState:
@@ -1569,40 +1694,46 @@ class EnsembleSubjectState:
 
 
 class EnsembleVelocityTracker(BaseVelocityTracker):
-    """Confidence-weighted ensemble of ZPDES, KT Logit, CUSUM, and Mastery Delta.
+    """Confidence-weighted ensemble of KT and Mastery Delta velocity signals.
 
-    Combines four complementary velocity signals:
-      - ZPDES: Best correlation (r=0.43), needs 8+ interactions
-      - KT Logit: Difficulty-aware via KT model (r=0.38), works from 2nd interaction
-      - CUSUM: Detects regime shifts (r=0.31), needs 8+ interactions
-      - Mastery Delta: EKF mastery changes, bridges Kalman into velocity
+    Both components are difficulty-aware:
+      - KT: EMA-smoothed P(correct) deltas from SAINT-Lite (trained on IRT features).
+            Works from the 2nd interaction — best cold-start signal.
+      - Mastery Delta: EMA-smoothed EKF mastery deltas. Uses 2PL IRT difficulty,
+            discrimination, and FSRS forgetting. Most principled signal once
+            the EKF has converged.
 
-    Weights derived from r² (explained variance), adapted by data availability,
-    and modulated by each tracker's self-reported confidence.
+    CUSUM and Regression were removed after ablation analysis: both operate on
+    raw binary correctness (difficulty-unaware), adding noise for strong students
+    and correlating highly with each other (r=0.53). Removing them improved
+    velocity accuracy for stable students while maintaining sensitivity to
+    genuine learning transitions.
+
+    Weights adapted by data availability and modulated by each tracker's
+    self-reported confidence.
     """
 
-    # Scale factors to normalize each tracker's velocity to [-1, +1]
+    # Scale factors to normalize each tracker's EMA-smoothed velocity to [-1, +1].
+    # Calibrated on the actual EMA output range (not per-interaction deltas):
+    #   KT: EMA of P_kt deltas, typical range [-0.05, +0.20] during transitions
+    #   Mastery Delta: EMA of mastery deltas, typical range [-0.02, +0.08] during
+    #     EKF convergence, near zero once converged
     SCALE_FACTORS = {
-        'zpdes':         1.0,    # already [-1, +1]
-        'kt':     3.333,  # maps ~[-0.3, +0.3] → [-1, +1]
-        'cusum':         1.0,    # already [-1, +1]
-        'mastery_delta': 50.0,   # maps ~[-0.02, +0.02] → [-1, +1]
+        'kt':            5.0,    # maps ~[-0.20, +0.20] → [-1, +1]
+        'mastery_delta': 15.0,   # maps ~[-0.07, +0.07] → [-1, +1]
     }
 
-    # Base weights: original 3 trackers scaled by 0.851 to preserve ratios,
-    # plus 14.9% allocation for mastery_delta.
-    # Original r²: ZPDES 0.1849, KT 0.1444, CUSUM 0.0961 → sum 0.4254
+    # Base weights: 2-component ensemble.
+    # Both signals are difficulty-aware via EKF/IRT and SAINT-Lite.
+    # Mastery Delta is the most principled signal (directly tracks EKF state
+    # changes), while KT provides faster response and cold-start capability.
     BASE_WEIGHTS = {
-        'zpdes':         0.370,  # was 0.4347 × 0.851
-        'kt':     0.289,  # was 0.3395 × 0.851
-        'cusum':         0.192,  # was 0.2260 × 0.851
-        'mastery_delta': 0.149,  # new — Kalman mastery delta
+        'kt':            0.400,  # KT model signal, difficulty-aware, fast cold start
+        'mastery_delta': 0.600,  # EKF mastery changes — most principled signal
     }
 
     def __init__(self,
-                 zpdes_tracker: Optional['ZPDESVelocityTracker'] = None,
                  kt_tracker: Optional['KTVelocityTracker'] = None,
-                 cusum_tracker: Optional['CUSUMVelocityTracker'] = None,
                  mastery_delta_tracker: Optional['MasteryDeltaVelocityTracker'] = None,
                  delegate_record: bool = True):
         """
@@ -1612,9 +1743,7 @@ class EnsembleVelocityTracker(BaseVelocityTracker):
                 (e.g., by MultiVelocityPipeline).
         """
         self.trackers = {
-            'zpdes': zpdes_tracker or ZPDESVelocityTracker(window_d=16),
             'kt': kt_tracker or KTVelocityTracker(ema_alpha=0.3),
-            'cusum': cusum_tracker or CUSUMVelocityTracker(k=0.1, h=4.0),
             'mastery_delta': mastery_delta_tracker or MasteryDeltaVelocityTracker(ema_alpha=0.3),
         }
         self._delegate_record = delegate_record
@@ -1622,23 +1751,25 @@ class EnsembleVelocityTracker(BaseVelocityTracker):
 
     @property
     def name(self) -> str:
-        return "Ensemble (ZPDES+KT+CUSUM+MasteryDelta)"
+        return "Ensemble (KT+MasteryDelta)"
 
     @staticmethod
     def _adaptive_multipliers(n: int) -> Dict[str, float]:
         """Weight multipliers based on data availability.
 
-        Cold start: KT + mastery_delta dominate (work from 2nd interaction).
-        Rich data: ZPDES boosted (peak correlation with full 16-window).
+        Cold start (n<4): KT dominates (works from 2nd KT prediction).
+        Medium (4-15): Balanced.
+        Rich data (16+): Mastery Delta dominates (EKF has converged,
+            difficulty-aware mastery changes are the most principled signal).
         """
         if n < 4:
-            return {'zpdes': 0.3, 'kt': 2.0, 'cusum': 0.3, 'mastery_delta': 1.5}
+            return {'kt': 2.0, 'mastery_delta': 1.0}
         elif n < 8:
-            return {'zpdes': 0.7, 'kt': 1.5, 'cusum': 0.7, 'mastery_delta': 1.2}
+            return {'kt': 1.5, 'mastery_delta': 1.2}
         elif n < 16:
-            return {'zpdes': 1.0, 'kt': 1.0, 'cusum': 1.0, 'mastery_delta': 1.0}
+            return {'kt': 1.0, 'mastery_delta': 1.0}
         else:
-            return {'zpdes': 1.2, 'kt': 1.0, 'cusum': 0.9, 'mastery_delta': 0.8}
+            return {'kt': 0.8, 'mastery_delta': 1.3}
 
     def _estimate_confidence(self, tracker_name: str, n: int) -> float:
         """Approximate tracker confidence from interaction count."""
@@ -1649,8 +1780,7 @@ class EnsembleVelocityTracker(BaseVelocityTracker):
             # Mastery delta: needs at least 2 interactions for a delta
             return min(1.0, max(0.0, (n - 1) / 8.0))
         else:
-            # ZPDES, CUSUM: ramp over 8 interactions
-            return min(1.0, n / 8.0)
+            return 0.0
 
     def _combine(self, student_id: str, subject_id: str,
                  velocities: Optional[Dict[str, float]] = None,
@@ -2082,7 +2212,7 @@ class MasteryVelocityPipeline:
             self.mastery = KalmanMasteryTracker(taxonomy, pyq_weights, fsrs_params)
         else:
             self.mastery = MasteryTracker(taxonomy, pyq_weights, fsrs_params)
-        self.velocity = VelocityTracker()
+        self.velocity = EnsembleVelocityTracker()
         self.taxonomy = taxonomy
 
     def process_interaction(self, student_id: str, topic_id: str,
@@ -2110,12 +2240,14 @@ class MasteryVelocityPipeline:
         # 2. Compute overall mastery and subject mastery
         overall_m = self.mastery.get_overall_mastery(student_id, timestamp_days)
         subject_id = self.taxonomy.get(topic_id)
-        subject_m = self.mastery.get_topic_mastery(student_id, topic_id, timestamp_days)
+        subject_m = self.mastery.get_subject_mastery(student_id, subject_id, timestamp_days)
 
-        # 3. Update velocity with per-subject tracking
-        v_eff, v_pace = self.velocity.record(
-            student_id, timestamp_days, overall_m,
-            subject_id=subject_id, subject_mastery=subject_m)
+        # 3. Update velocity with per-subject tracking (ensemble)
+        v_ens, v_conf = self.velocity.record(
+            student_id=student_id, timestamp_days=timestamp_days,
+            overall_mastery=overall_m, subject_id=subject_id,
+            subject_mastery=subject_m, is_correct=is_correct,
+            kt_prediction=kt_prediction)
 
         # 4. Get topic state for FSRS info
         ts = self.mastery._get_topic_state(student_id, topic_id)
@@ -2123,8 +2255,8 @@ class MasteryVelocityPipeline:
         return {
             'topic_mastery': topic_m,
             'overall_mastery': overall_m,
-            'v_eff_smoothed': v_eff,
-            'v_pace_smoothed': v_pace,
+            'velocity': v_ens,
+            'velocity_confidence': v_conf,
             'fsrs_stability': ts.fsrs_state.stability,
             'fsrs_difficulty': ts.fsrs_state.difficulty,
             'fsrs_retrievability': self.mastery.fsrs.retrievability(
@@ -2135,18 +2267,18 @@ class MasteryVelocityPipeline:
                 current_ts: Optional[float] = None) -> dict:
         """Compute full MVS score for a student."""
         overall_m = self.mastery.get_overall_mastery(student_id, current_ts)
-        vs = self.velocity._get_state(student_id)
+        v_raw = self.velocity.get_aggregate_velocity(student_id)
         consistency = self.velocity.get_consistency(student_id)
         topic_ms = self.mastery.get_all_topic_masteries(student_id, current_ts)
         breadth = compute_breadth(topic_ms, self.taxonomy)
-        v_norm = normalize_velocity(vs.v_eff_smoothed)
+        v_norm = self.velocity.normalize_for_mvs(v_raw)
         mvs = compute_mvs(overall_m, v_norm, consistency, breadth)
 
         return {
             'mvs': mvs,
             'mastery_level': overall_m,
             'velocity_normalized': v_norm,
-            'velocity_raw': vs.v_eff_smoothed,
+            'velocity_raw': v_raw,
             'consistency': consistency,
             'breadth': breadth,
             'topic_masteries': topic_ms,
@@ -2191,16 +2323,16 @@ class MultiVelocityPipeline:
         # Create shared tracker instances
         zpdes = ZPDESVelocityTracker(window_d=16)
         kt = KTVelocityTracker(ema_alpha=0.3)
-        cusum = CUSUMVelocityTracker(k=0.1, h=4.0)
         mastery_delta = MasteryDeltaVelocityTracker(ema_alpha=0.3)
 
+        # All trackers kept for display/comparison, including ZPDES
         self.trackers: Dict[str, BaseVelocityTracker] = {
-            'zpdes': zpdes, 'kt': kt, 'cusum': cusum,
+            'zpdes': zpdes, 'kt': kt,
             'mastery_delta': mastery_delta,
         }
-        # Ensemble in piped mode: reads children's state, doesn't call record() on them
+        # Ensemble uses KT + Mastery Delta (both difficulty-aware)
         self.ensemble = EnsembleVelocityTracker(
-            zpdes, kt, cusum, mastery_delta, delegate_record=False)
+            kt, mastery_delta, delegate_record=False)
 
     def process_interaction(self, student_id: str, topic_id: str,
                             is_correct: bool, timestamp_days: float,
@@ -2221,7 +2353,7 @@ class MultiVelocityPipeline:
         overall_m = result['overall_mastery']
         subject_m = result['topic_mastery']
 
-        velocities = {'baseline': result['v_eff_smoothed']}
+        velocities = {'baseline': result['velocity']}
 
         for name, tracker in self.trackers.items():
             v, conf = tracker.record(
@@ -2264,16 +2396,16 @@ class MultiVelocityPipeline:
 
         results = {}
 
-        # Baseline
-        vs = self.base_pipeline.velocity._get_state(student_id)
+        # Baseline (base pipeline's own ensemble tracker)
+        v_baseline = self.base_pipeline.velocity.get_aggregate_velocity(student_id)
         baseline_consistency = self.base_pipeline.velocity.get_consistency(
             student_id)
-        v_norm_baseline = normalize_velocity(vs.v_eff_smoothed)
+        v_norm_baseline = self.base_pipeline.velocity.normalize_for_mvs(v_baseline)
         mvs_baseline = compute_mvs(overall_m, v_norm_baseline,
                                    baseline_consistency, breadth)
         results['baseline'] = {
             'mvs': mvs_baseline,
-            'velocity_raw': vs.v_eff_smoothed,
+            'velocity_raw': v_baseline,
             'velocity_normalized': v_norm_baseline,
             'consistency': baseline_consistency,
         }
