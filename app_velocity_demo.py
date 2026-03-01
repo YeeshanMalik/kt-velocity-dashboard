@@ -3,7 +3,7 @@ Streamlit Demo: Knowledge Tracing + Velocity Dashboard
 
 Sections:
   1. Student Overview — metrics + cumulative accuracy chart
-  2. Velocity Dashboard — compare 4 approaches (Baseline/ZPDES/KT Logit/CUSUM)
+  2. Velocity Dashboard — KT + Mastery Delta ensemble (both difficulty-aware)
   3. Per-Subject Velocity Table — color-coded by sign
   4. Velocity Over Time — Plotly line chart
   5. Algorithm Explanations — LaTeX + worked examples
@@ -251,8 +251,10 @@ def load_data():
     subjects = sorted(df['subject'].unique())
     taxonomy = {s: s for s in subjects}
     user_idx_to_id = dict(zip(df['user_idx'], df['user_id']))
+    subject_idx_to_name = dict(df.drop_duplicates('subject_idx')[['subject_idx', 'subject']].values)
+    subject_idx_to_name = {int(k): v for k, v in subject_idx_to_name.items()}
 
-    return df, n_skills, n_patterns, feature_cols, test_user_idxs, taxonomy, user_idx_to_id, cont_mean, cont_std
+    return df, n_skills, n_patterns, feature_cols, test_user_idxs, taxonomy, user_idx_to_id, cont_mean, cont_std, subject_idx_to_name
 
 
 @st.cache_resource(show_spinner="Loading SAINT-Lite model...")
@@ -352,6 +354,53 @@ def get_student_predictions(model, df, feature_cols, cont_mean, cont_std, user_i
     return ud.reset_index(drop=True), preds
 
 
+def get_all_subject_predictions(model, df, feature_cols, cont_mean, cont_std,
+                                user_idx, subject_idx_to_name):
+    """Get SAINT-Lite P(correct) for ALL subjects from the student's last position.
+
+    The model outputs Dense(n_skills) logits at every position. This function
+    extracts all logits from the final position — giving the model's current
+    belief about the student across every subject simultaneously.
+    """
+    sort_col = 'submitted_at' if 'submitted_at' in df.columns else 'created_at'
+    ud = df[df['user_idx'] == user_idx].sort_values(sort_col)
+    if len(ud) < 2:
+        return {v: 0.5 for v in subject_idx_to_name.values()}
+
+    sk = ud['subject_idx'].values
+    co = ud['correct'].values
+    pa = ud['pattern_idx'].values
+    n_f = len(feature_cols)
+    ff = (ud[feature_cols].fillna(0).values - cont_mean.values) / cont_std.values
+    ia = sk * 2 + co
+    n = len(sk)
+    max_seq = 200
+
+    # Use the last chunk (most recent context)
+    if n <= max_seq:
+        seq_len = n - 1
+        ip = ia[:seq_len].reshape(1, seq_len)
+        pp = pa[:seq_len].reshape(1, seq_len)
+        fp = ff[:seq_len].reshape(1, seq_len, n_f)
+    else:
+        start = n - max_seq
+        seq_len = max_seq - 1
+        ip = ia[start:start + seq_len].reshape(1, seq_len)
+        pp = pa[start:start + seq_len].reshape(1, seq_len)
+        fp = ff[start:start + seq_len].reshape(1, seq_len, n_f)
+
+    logits = model({'interactions': ip, 'patterns': pp, 'forget_features': fp},
+                   training=False).numpy()  # (1, seq_len, n_skills)
+
+    # Extract ALL subject logits from the last position
+    last_logits = logits[0, -1, :]  # (n_skills,)
+    all_probs = 1.0 / (1.0 + np.exp(-last_logits))
+
+    return {subject_idx_to_name[i]: float(all_probs[i])
+            for i in range(len(all_probs))
+            if i in subject_idx_to_name}
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # PROCESS ONE STUDENT (cached)
 # ═══════════════════════════════════════════════════════════════════════
@@ -374,7 +423,7 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
     velocity_timeline = {
         'interaction': [], 'subject': [], 'is_correct': [], 'kt_prediction': [],
         'timestamp_days': [],
-        'baseline': [], 'zpdes': [], 'kt': [], 'cusum': [],
+        'baseline': [], 'zpdes': [], 'kt': [],
         'mastery_delta': [], 'ensemble': [],
         'cumulative_accuracy': [],
     }
@@ -408,7 +457,6 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
         velocity_timeline['baseline'].append(result['velocities']['baseline'])
         velocity_timeline['zpdes'].append(result['velocities']['zpdes'])
         velocity_timeline['kt'].append(result['velocities']['kt'])
-        velocity_timeline['cusum'].append(result['velocities']['cusum'])
         velocity_timeline['mastery_delta'].append(result['velocities']['mastery_delta'])
         velocity_timeline['ensemble'].append(result['velocities']['ensemble'])
         velocity_timeline['cumulative_accuracy'].append(running_correct / (i + 1))
@@ -437,7 +485,6 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
             'Actual Delta': actual_delta,
             'ZPDES': pipeline.trackers['zpdes'].get_subject_velocity(real_uid, subj),
             'KT Logit': pipeline.trackers['kt'].get_subject_velocity(real_uid, subj),
-            'CUSUM': pipeline.trackers['cusum'].get_subject_velocity(real_uid, subj),
             'Mastery \u0394': pipeline.trackers['mastery_delta'].get_subject_velocity(real_uid, subj),
             'Ensemble': pipeline.ensemble.get_subject_velocity(real_uid, subj),
         })
@@ -498,7 +545,7 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
 def compute_aggregate_metrics(_model, _df, _feature_cols, _cont_mean, _cont_std,
                               _taxonomy, _user_idx_to_id, test_user_idxs_tuple):
     test_user_idxs = set(test_user_idxs_tuple)
-    approach_names = ['baseline', 'zpdes', 'kt', 'cusum', 'mastery_delta', 'ensemble']
+    approach_names = ['baseline', 'zpdes', 'kt', 'mastery_delta', 'ensemble']
     student_results = []
     subject_results = []
 
@@ -552,12 +599,9 @@ def compute_aggregate_metrics(_model, _df, _feature_cols, _cont_mean, _cont_std,
                 'subject': subj,
                 'n_interactions': len(corr),
                 'actual_improvement': corr[mid:].mean() - corr[:mid].mean(),
-                'baseline_velocity': 0.0,
+                'baseline_velocity': pipeline.base_pipeline.velocity.get_subject_velocity(
+                    real_uid, subj),
             }
-            if real_uid in pipeline.base_pipeline.velocity.students:
-                sv = pipeline.base_pipeline.velocity.students[real_uid].subject_velocities
-                if subj in sv:
-                    subj_row['baseline_velocity'] = sv[subj].v_eff_smoothed
             for name, tracker in pipeline.trackers.items():
                 subj_row[f'{name}_velocity'] = tracker.get_subject_velocity(real_uid, subj)
             subj_row['ensemble_velocity'] = pipeline.ensemble.get_subject_velocity(real_uid, subj)
@@ -617,7 +661,7 @@ def compute_aggregate_metrics(_model, _df, _feature_cols, _cont_mean, _cont_std,
 # MAIN APP
 # ═══════════════════════════════════════════════════════════════════════
 
-df, n_skills, n_patterns, feature_cols, test_user_idxs, taxonomy, user_idx_to_id, cont_mean, cont_std = load_data()
+df, n_skills, n_patterns, feature_cols, test_user_idxs, taxonomy, user_idx_to_id, cont_mean, cont_std, subject_idx_to_name = load_data()
 model = load_model(n_skills, n_patterns, len(feature_cols))
 
 n_students = df['user_id'].nunique()
@@ -1027,16 +1071,16 @@ with tab_dashboard:
 
     st.header("Learning Velocity")
     st.caption("Velocity measures **how fast** a student is improving (or declining). "
-               "The **Ensemble** combines ZPDES, KT Logit, and CUSUM with adaptive confidence weighting. "
-               "Individual trackers are shown for comparison.")
+               "The **Ensemble** combines KT and Mastery Delta — both difficulty-aware signals — with adaptive confidence weighting. "
+               "ZPDES is shown for comparison but not used in the ensemble.")
 
     # Ensemble first (primary metric)
     ens_mvs = result['mvs_all']['ensemble']
     st.subheader("Ensemble Velocity")
     ecol1, ecol2, ecol3, ecol4 = st.columns(4)
     ecol1.metric("Velocity", f"{ens_mvs['velocity_raw']:+.4f}",
-                 help="Confidence-weighted combination of ZPDES, KT Logit, CUSUM, and Mastery Delta. "
-                      "Weights adapt to data availability: KT Logit dominates early, ZPDES dominates with 16+ interactions.")
+                 help="Confidence-weighted combination of KT and Mastery Delta (both difficulty-aware). "
+                      "KT dominates early (cold start), Mastery Delta dominates with 16+ interactions.")
     ecol2.metric("MVS", f"{ens_mvs['mvs']:.1f}",
                  help="Mastery-Velocity Score from the ensemble. "
                       "Combines: mastery level, velocity, consistency, and breadth.")
@@ -1051,25 +1095,22 @@ with tab_dashboard:
     approaches = [
         ('zpdes', 'ZPDES', '#2563eb'),
         ('kt', 'KT Logit', '#7c3aed'),
-        ('cusum', 'CUSUM', '#ea580c'),
         ('mastery_delta', 'Mastery \u0394', '#0d9488'),
     ]
     approach_label_map = {k: label for k, label, _ in approaches}
     approach_label_map['ensemble'] = 'Ensemble'
 
-    cols = st.columns(4)
+    cols = st.columns(3)
     for i, (key, label, color) in enumerate(approaches):
         mvs = result['mvs_all'][key]
         with cols[i]:
             st.markdown(f"**{label}**")
             st.metric("Velocity", f"{mvs['velocity_raw']:+.4f}",
                        help={
-                           'zpdes': "ZPDES: Compares recent accuracy (last 8) vs older accuracy (8 before that). "
+                           'zpdes': "ZPDES: Compares recent accuracy (adaptive window) vs older accuracy. "
                                     "Range [-1, +1]. Self-calibrating — no model needed.",
                            'kt': "KT P(\u0394): Change in SAINT-Lite model's P(correct) between consecutive questions, "
                                         "smoothed with EMA. Uses the neural network's view of student progress.",
-                           'cusum': "CUSUM: Cumulative sum of deviations from baseline accuracy. "
-                                    "Detects sudden shifts in performance. Range ~[-1, +1].",
                            'mastery_delta': "Mastery \u0394: EMA-smoothed change in Kalman mastery per interaction. "
                                             "Directly reflects EKF's estimate of learning progress.",
                        }[key])
@@ -1104,9 +1145,9 @@ with tab_dashboard:
         styled = sdf.style.format({
             '1st Half Acc': '{:.1%}', '2nd Half Acc': '{:.1%}',
             'Actual Delta': '{:+.3f}',
-            'ZPDES': '{:+.4f}', 'KT Logit': '{:+.4f}', 'CUSUM': '{:+.4f}',
+            'ZPDES': '{:+.4f}', 'KT Logit': '{:+.4f}',
             'Mastery \u0394': '{:+.4f}', 'Ensemble': '{:+.4f}',
-        }).map(color_velocity, subset=['Actual Delta', 'ZPDES', 'KT Logit', 'CUSUM', 'Mastery \u0394', 'Ensemble'])
+        }).map(color_velocity, subset=['Actual Delta', 'ZPDES', 'KT Logit', 'Mastery \u0394', 'Ensemble'])
 
         st.dataframe(styled, use_container_width=True, hide_index=True)
         st.caption("**Actual Delta** = 2nd half accuracy - 1st half accuracy. "
@@ -1145,12 +1186,11 @@ with tab_dashboard:
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
     )
     st.plotly_chart(fig_vel, use_container_width=True)
-    st.caption("**Ensemble** (green, solid) is the confidence-weighted combination. "
+    st.caption("**Ensemble** (green, solid) is the confidence-weighted combination of KT and Mastery Delta (both difficulty-aware). "
                "Component trackers shown as dotted lines: "
-               "**ZPDES** (blue) reacts to streaks, "
-               "**KT Logit** (purple) tracks what the neural network thinks, "
-               "**CUSUM** (orange) detects regime changes, "
-               "**Mastery \u0394** (teal) tracks EKF mastery changes.")
+               "**KT Logit** (purple) tracks the SAINT-Lite model's view, "
+               "**Mastery \u0394** (teal) tracks EKF mastery changes, "
+               "**ZPDES** (blue) shown for reference but not in ensemble.")
 
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1166,27 +1206,29 @@ with tab_dashboard:
     $$v_{\text{ensemble}} = \frac{\sum_k w_k \cdot m_k(n) \cdot c_k \cdot \tilde{v}_k}{\sum_k w_k \cdot m_k(n) \cdot c_k}$$
 
     Where:
-    - $w_k$: base weight (ZPDES=0.370, KT Logit=0.289, CUSUM=0.192, Mastery \u0394=0.149)
+    - $w_k$: base weight (KT=0.400, Mastery \u0394=0.600)
     - $m_k(n)$: adaptive multiplier based on interaction count $n$
     - $c_k$: tracker self-reported confidence (ramps with data availability)
     - $\tilde{v}_k$: velocity scaled to [-1, +1]
 
     **Adaptive multipliers by data regime:**
 
-    | Interactions | ZPDES | KT Logit | CUSUM | Mastery Δ | Rationale |
-    |:---:|:---:|:---:|:---:|:---:|:---|
-    | n < 4 | 0.3 | **2.0** | 0.3 | 1.5 | Cold start: KT works from 2nd interaction |
-    | 4-7 | 0.7 | **1.5** | 0.7 | 1.2 | Warming up: KT still leads |
-    | 8-15 | 1.0 | 1.0 | 1.0 | 1.0 | Balanced: all trackers at full window |
-    | 16+ | **1.2** | 1.0 | 0.9 | 0.8 | Rich data: ZPDES peaks (full 16-window) |
+    | Interactions | KT | Mastery \u0394 | Rationale |
+    |:---:|:---:|:---:|:---|
+    | n < 4 | **2.0** | 1.0 | Cold start: KT works from 2nd interaction |
+    | 4-7 | **1.5** | 1.2 | Warming up: KT still leads |
+    | 8-15 | 1.0 | 1.0 | Balanced: both trackers at full weight |
+    | 16+ | 0.8 | **1.3** | Rich data: Mastery Delta dominates (EKF converged) |
 
     **Why it works:**
-    Each tracker has complementary strengths:
-    - ZPDES: Best average correlation (r=0.43), needs 8+ interactions
-    - KT Logit: Difficulty-aware via KT model (r=0.38), works from 2nd interaction
-    - CUSUM: Detects regime shifts (r=0.31), jumpiest signal
+    Both components are **difficulty-aware** — they account for question difficulty and discrimination:
+    - **KT (40%)**: EMA-smoothed change in SAINT-Lite P(correct). Trained on IRT features, so getting a
+      hard question wrong causes a smaller velocity drop than a raw binary signal would. Fast cold start.
+    - **Mastery Delta (60%)**: EMA-smoothed change in EKF mastery (sigmoid(theta)). Uses 2PL IRT difficulty,
+      discrimination, and FSRS forgetting curve. The most principled velocity signal.
 
-    The ensemble smooths disagreements and adapts to data availability.
+    CUSUM and Regression were removed: both used raw binary correctness (difficulty-unaware) and added noise
+    for stable students. ZPDES is shown for reference but not in the ensemble.
     """)
 
     with st.expander("ZPDES Learning Progress (Clement et al., 2015)"):
@@ -1195,12 +1237,14 @@ with tab_dashboard:
 
     $$LP(t) = \overline{\text{outcomes}[t-d/2 : t]} - \overline{\text{outcomes}[t-d : t-d/2]}$$
 
-    Where $d = 16$ (window size). Operates on **raw binary correctness** (1/0), not smoothed mastery.
+    Where $d$ is adaptive: $d = \max(16, \min(n/2, 64))$ and $n$ = total interactions for that subject.
+    Operates on **raw binary correctness** (1/0), not smoothed mastery.
 
     **How it works:**
-    1. Maintain a sliding window of the last 16 binary outcomes per subject
-    2. Split into two halves: recent 8 and older 8
-    3. LP = mean(recent) - mean(older)
+    1. Maintain the full outcome history per subject
+    2. Compute adaptive window size $d$ based on how much data exists
+    3. Split last $d$ outcomes into two halves: recent $d/2$ and older $d/2$
+    4. LP = mean(recent) - mean(older)
 
     **Range:** [-1, +1]. Positive = improving, negative = declining.
 
@@ -1239,33 +1283,6 @@ with tab_dashboard:
     **Key limitation:** Measures prediction change, not actual learning.
     """)
 
-    with st.expander("CUSUM Changepoint Detection"):
-        st.markdown(r"""
-    **Formulas (two-sided CUSUM):**
-
-    $$S_t^+ = \max(0, S_{t-1}^+ + (x_t - \mu_0 - k))$$
-    $$S_t^- = \max(0, S_{t-1}^- + (\mu_0 - k - x_t))$$
-
-    Where $k = 0.1$ (sensitivity), $h = 4.0$ (threshold), $x_t \in \{0, 1\}$.
-
-    **Continuous velocity:** $(S^+ - S^-) / h$
-
-    **How it works:**
-    1. Track running baseline accuracy ($\mu_0$) via slow EMA ($\alpha = 0.05$)
-    2. Accumulate positive deviations in $S^+$ (student doing better than baseline)
-    3. Accumulate negative deviations in $S^-$ (student doing worse)
-    4. When $S^+ > h$: declare "improvement" changepoint, reset $S^+$
-    5. When $S^- > h$: declare "decline" changepoint, reset $S^-$
-
-    **Worked example:**
-    Baseline $\mu_0 = 0.5$, $k = 0.1$
-    Outcomes: [1, 1, 1, 0, 1, 1, 1, 1]
-    $S^+$: [0.4, 0.8, 1.2, 0.8, 1.2, 1.6, 2.0, 2.4]
-    $S^-$: [0, 0, 0, 0.2, 0, 0, 0, 0]
-    **Velocity = (2.4 - 0.0) / 4.0 = +0.60** (strong upward drift)
-
-    **Unique advantage:** Can detect discrete regime shifts, not just gradual trends.
-    """)
 
 
 
@@ -1343,14 +1360,14 @@ with tab_dashboard:
     # Show scored recommendations for this student
     st.subheader("Recommendations for This Student")
 
-    # Build KT predictions dict from timeline
+    # Get SAINT-Lite P(correct) for ALL subjects from model's last position
     pipeline = result.get('pipeline')
     rec_data = []
     if pipeline:
         real_uid = result['real_uid']
-        kt_by_subject = {}
-        for _, row in vt.iterrows():
-            kt_by_subject[row['subject']] = row['kt_prediction']
+        kt_by_subject = get_all_subject_predictions(
+            model, df, feature_cols, cont_mean, cont_std,
+            selected_user_idx, subject_idx_to_name)
 
         # Use the pipeline's ITZS scoring (single source of truth)
         last_ts = vt['timestamp_days'].max() if 'timestamp_days' in vt.columns else None
@@ -1436,15 +1453,14 @@ with tab_dashboard:
             taxonomy, user_idx_to_id, tuple(sorted(test_user_idxs)))
 
         approach_labels = {
-            'zpdes': 'ZPDES (d=16)',
+            'zpdes': 'ZPDES (adaptive)',
             'kt': 'KT Logit Deriv',
-            'cusum': 'CUSUM',
             'mastery_delta': 'Mastery Delta',
             'ensemble': 'Ensemble',
         }
 
         agg_data = []
-        for key in ['ensemble', 'zpdes', 'kt', 'cusum', 'mastery_delta']:
+        for key in ['ensemble', 'zpdes', 'kt', 'mastery_delta']:
             m = metrics[key]
             sig_student = '*' if m.get('pearson_student_p', 1) < 0.05 else ''
             sig_subject = '*' if m.get('pearson_subject_p', 1) < 0.05 else ''
@@ -1953,8 +1969,8 @@ Constitutional Bodies). Each topic has its own Kalman state.
 **Step 7: FEED into velocity and recommendations**
 
 The mastery estimate feeds into:
-1. **Velocity trackers** — ZPDES, KT Logit, CUSUM, and Ensemble compare recent vs older
-   mastery trends to detect improvement or decline
+1. **Velocity trackers** — KT and Mastery Delta (both difficulty-aware) combine into an Ensemble
+   that detects improvement or decline
 2. **MVS score** — Mastery-Velocity Score combines: 40% mastery level, 30% velocity,
    15% consistency, 15% breadth (how many subjects studied)
 3. **ITZS recommendations** — Expected Learning Gain, Review Urgency, Information Gain,
@@ -1989,10 +2005,8 @@ Binary Response (correct / wrong)
         ▼                 ▼
   ┌───────────┐   ┌────────────────────────────────────────┐
   │  Mastery  │   │  Velocity Trackers                     │
-  │  (level)  │   │  ZPDES:      recent vs older accuracy  │
-  │           │   │  KT Logit:   SAINT delta, EMA smoothed │
-  │           │   │  CUSUM:      cumulative shift detection │
-  │           │   │  Mastery Δ:  EKF mastery delta, EMA    │
+  │  (level)  │   │  KT (40%):   SAINT delta, EMA smoothed │
+  │           │   │  Mastery Δ (60%): EKF delta, EMA       │
   │           │   │           ↓                             │
   │           │   │  Ensemble: confidence-weighted combo    │
   └─────┬─────┘   └──────────────┬─────────────────────────┘
