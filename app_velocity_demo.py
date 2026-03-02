@@ -305,7 +305,7 @@ def get_student_predictions(model, df, feature_cols, cont_mean, cont_std, user_i
                        training=False).numpy()
         tgt = sk[1:n]
         oh = np.eye(logits.shape[-1])[tgt]
-        preds[1:n] = 1.0 / (1.0 + np.exp(-np.sum(logits[0] * oh, axis=-1)))
+        preds[1:n] = np.clip(1.0 / (1.0 + np.exp(-np.sum(logits[0] * oh, axis=-1))), 0.01, 0.99)
     else:
         # Collect all chunks, then run as a single batch
         stride = max_seq // 2
@@ -336,7 +336,7 @@ def get_student_predictions(model, df, feature_cols, cont_mean, cont_std, user_i
         # Fill predictions from first chunk
         tgt0 = sk[1:max_seq]
         oh0 = np.eye(all_logits.shape[-1])[tgt0]
-        preds[1:max_seq] = 1.0 / (1.0 + np.exp(-np.sum(all_logits[0] * oh0, axis=-1)))
+        preds[1:max_seq] = np.clip(1.0 / (1.0 + np.exp(-np.sum(all_logits[0] * oh0, axis=-1))), 0.01, 0.99)
         covered_up_to = max_seq
 
         # Fill from remaining chunks (only the new positions)
@@ -348,7 +348,7 @@ def get_student_predictions(model, df, feature_cols, cont_mean, cont_std, user_i
             offset = fill_from - cs - 1
             tgt = sk[cs + 1:ce]
             oh = np.eye(all_logits.shape[-1])[tgt]
-            chunk_probs = 1.0 / (1.0 + np.exp(-np.sum(all_logits[i] * oh, axis=-1)))
+            chunk_probs = np.clip(1.0 / (1.0 + np.exp(-np.sum(all_logits[i] * oh, axis=-1))), 0.01, 0.99)
             if offset < len(chunk_probs):
                 preds[fill_from:ce] = chunk_probs[offset:]
             covered_up_to = ce
@@ -396,7 +396,7 @@ def get_all_subject_predictions(model, df, feature_cols, cont_mean, cont_std,
 
     # Extract ALL subject logits from the last position
     last_logits = logits[0, -1, :]  # (n_skills,)
-    all_probs = 1.0 / (1.0 + np.exp(-last_logits))
+    all_probs = np.clip(1.0 / (1.0 + np.exp(-last_logits)), 0.01, 0.99)
 
     return {subject_idx_to_name[i]: float(all_probs[i])
             for i in range(len(all_probs))
@@ -892,10 +892,11 @@ with tab_dashboard:
 
     st.header("Mastery State (KT-Fused Extended Kalman Filter)")
     st.caption("The KT-Fused EKF combines SAINT-Lite's cross-subject predictions with "
-               "the Extended Kalman Filter's per-topic ability tracking. It estimates "
-               "ability (theta) and learning rate (alpha) per subject, with "
-               "mastery = sigmoid(theta). Confidence grows with more observations and "
-               "shrinks after long gaps (FSRS forgetting).")
+               "the Extended Kalman Filter's per-topic ability tracking. It jointly estimates "
+               "ability (theta) and learning rate (alpha) per subject. At each interaction, "
+               "alpha is folded into theta via the state transition (theta += alpha), so "
+               "mastery = sigmoid(theta) already reflects the cumulative learning trend. "
+               "Confidence grows with more observations and shrinks after long gaps (FSRS forgetting).")
 
     pipeline = result.get('pipeline')
     if pipeline and hasattr(pipeline, 'base_pipeline'):
@@ -1009,8 +1010,8 @@ with tab_dashboard:
                 st.dataframe(styled_mastery, use_container_width=True, hide_index=True)
                 st.caption(
                     "**theta** = ability (logit scale, 0 = average). "
-                    "**alpha** = learning rate (positive = improving). "
-                    "**Mastery** = sigmoid(theta), green >= 0.70, red <= 0.40. "
+                    "**alpha** = learning rate (positive = improving, folded into theta each step). "
+                    "**Mastery** = sigmoid(theta) — theta already includes alpha's cumulative effect. Green >= 0.70, red <= 0.40. "
                     "**Confidence** = 1 / (1 + sqrt(variance)), grows with data, shrinks with gaps."
                 )
 
@@ -1937,7 +1938,11 @@ After 3 interactions:
 **How is mastery calculated?**
 
 Mastery is computed per topic as **sigmoid(theta)**, where theta is the student's latent ability
-estimated by a KT-Fused Extended Kalman Filter. The system has **two models** that work together:
+estimated by a KT-Fused Extended Kalman Filter. The EKF jointly tracks a 2D state vector
+**[theta, alpha]** — ability and learning rate. At every interaction, the predict step applies
+`theta_new = gamma * theta + alpha`, so **alpha is continuously folded into theta** before the
+mastery readout. The sigmoid(theta) you see already reflects the cumulative effect of the
+student's learning rate. The system has **two models** that work together:
 
 | Model | What it does | Strengths |
 |-------|-------------|-----------|
@@ -1969,7 +1974,8 @@ Neither model alone is sufficient:
     │  4. UPDATE:      2PL IRT observation — binary outcome adjusts theta  │
     │                  Kalman gain adapts by uncertainty                    │
     │                                                                      │
-    │  OUTPUT: mastery = sigmoid(theta),  confidence = 1/(1 + sqrt(P[0,0]))│
+    │  OUTPUT: mastery = sigmoid(theta)   [theta already includes alpha]    │
+    │          confidence = 1/(1 + sqrt(P[0,0]))                           │
     └──────────────────────────────────────────────────────────────────────┘
 
     Key: KT enters the PREDICT step, binary outcomes enter the UPDATE step
@@ -2048,9 +2054,9 @@ The state transition is:
 
 | Output | Formula | Meaning |
 |--------|---------|---------|
-| mastery | sigmoid(theta) | Probability scale [0, 1]. A student with theta=1.5 has mastery 0.82. |
+| mastery | sigmoid(theta) | Probability scale [0, 1]. A student with theta=1.5 has mastery 0.82. Note: theta already incorporates alpha — the predict step adds alpha to theta at every interaction, so the learning rate is baked into the ability estimate before the sigmoid is applied. |
 | confidence | 1 / (1 + sqrt(P[0,0])) | How certain we are about theta. Starts at 0.5 (prior), rises toward 1 with more observations. Falls after long gaps. Never collapses to 0. |
-| learning_rate | alpha | Rate of ability change per interaction. Used by velocity trackers downstream. |
+| learning_rate | alpha | Rate of ability change per interaction (logit-units). Estimated jointly with theta by the EKF. Positive = improving, negative = declining. Folded into theta at each predict step, and also used by velocity trackers downstream. |
 
 **Subject mastery** is computed as the confidence-weighted mean of topic masteries within that
 subject. Topics where we have more data (higher confidence) contribute more. Topics the student
