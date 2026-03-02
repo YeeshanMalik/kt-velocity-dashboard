@@ -3,12 +3,14 @@ Streamlit Demo: Knowledge Tracing + Velocity Dashboard
 
 Sections:
   1. Student Overview — metrics + cumulative accuracy chart
-  2. Velocity Dashboard — KT + Mastery Delta ensemble (both difficulty-aware)
-  3. Per-Subject Velocity Table — color-coded by sign
-  4. Velocity Over Time — Plotly line chart
-  5. Algorithm Explanations — LaTeX + worked examples
-  6. Recommendation Scoring (v2) — ELG/ZPD/sigmoid/novelty
-  7. Summary Comparison — aggregate metrics
+  2. SAINT-Lite Model — actual vs predicted, calibration
+  3. Mastery State (EKF) — per-subject theta, alpha, mastery, confidence
+  4. Velocity Dashboard — KT + Mastery Delta ensemble (both difficulty-aware)
+  5. Per-Subject Velocity Table — color-coded by sign
+  6. Velocity Over Time — Plotly line chart
+  7. Algorithm Explanations — Ensemble, Mastery Delta, KT Logit
+  8. Recommendation Scoring (ITZS) — ELG/Review/InfoGain/Novelty
+  9. Aggregate Metrics — optional cross-student comparison
 """
 import warnings
 warnings.filterwarnings('ignore')
@@ -423,8 +425,7 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
     velocity_timeline = {
         'interaction': [], 'subject': [], 'is_correct': [], 'kt_prediction': [],
         'timestamp_days': [],
-        'baseline': [], 'zpdes': [], 'kt': [],
-        'mastery_delta': [], 'ensemble': [],
+        'kt': [], 'mastery_delta': [], 'ensemble': [],
         'cumulative_accuracy': [],
     }
     running_correct = 0
@@ -454,8 +455,6 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
         velocity_timeline['is_correct'].append(is_correct)
         velocity_timeline['kt_prediction'].append(kt_pred)
         velocity_timeline['timestamp_days'].append(ts_days)
-        velocity_timeline['baseline'].append(result['velocities']['baseline'])
-        velocity_timeline['zpdes'].append(result['velocities']['zpdes'])
         velocity_timeline['kt'].append(result['velocities']['kt'])
         velocity_timeline['mastery_delta'].append(result['velocities']['mastery_delta'])
         velocity_timeline['ensemble'].append(result['velocities']['ensemble'])
@@ -483,7 +482,6 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
             '1st Half Acc': first_acc,
             '2nd Half Acc': second_acc,
             'Actual Delta': actual_delta,
-            'ZPDES': pipeline.trackers['zpdes'].get_subject_velocity(real_uid, subj),
             'KT Logit': pipeline.trackers['kt'].get_subject_velocity(real_uid, subj),
             'Mastery \u0394': pipeline.trackers['mastery_delta'].get_subject_velocity(real_uid, subj),
             'Ensemble': pipeline.ensemble.get_subject_velocity(real_uid, subj),
@@ -545,7 +543,7 @@ def process_student(_model, _df, _feature_cols, _cont_mean, _cont_std,
 def compute_aggregate_metrics(_model, _df, _feature_cols, _cont_mean, _cont_std,
                               _taxonomy, _user_idx_to_id, test_user_idxs_tuple):
     test_user_idxs = set(test_user_idxs_tuple)
-    approach_names = ['baseline', 'zpdes', 'kt', 'mastery_delta', 'ensemble']
+    approach_names = ['kt', 'mastery_delta', 'ensemble']
     student_results = []
     subject_results = []
 
@@ -599,8 +597,6 @@ def compute_aggregate_metrics(_model, _df, _feature_cols, _cont_mean, _cont_std,
                 'subject': subj,
                 'n_interactions': len(corr),
                 'actual_improvement': corr[mid:].mean() - corr[:mid].mean(),
-                'baseline_velocity': pipeline.base_pipeline.velocity.get_subject_velocity(
-                    real_uid, subj),
             }
             for name, tracker in pipeline.trackers.items():
                 subj_row[f'{name}_velocity'] = tracker.get_subject_velocity(real_uid, subj)
@@ -868,15 +864,15 @@ with tab_dashboard:
     if not qs.empty:
         def color_match(val):
             if val == 'Yes':
-                return 'background-color: #dcfce7'
+                return 'background-color: rgba(34,197,94,0.2); color: #4ade80'
             elif val == 'No':
-                return 'background-color: #fee2e2'
+                return 'background-color: rgba(239,68,68,0.2); color: #f87171'
             return ''
 
         def color_actual(val):
             if val == 'Correct':
-                return 'color: #16a34a; font-weight: bold'
-            return 'color: #dc2626; font-weight: bold'
+                return 'color: #4ade80; font-weight: bold'
+            return 'color: #f87171; font-weight: bold'
 
         qs_styled = qs.style.format({
             'P(correct)': '{:.1%}',
@@ -989,17 +985,17 @@ with tab_dashboard:
 
                 def color_mastery(val):
                     if val >= 0.7:
-                        return 'background-color: #dcfce7'
+                        return 'background-color: rgba(34,197,94,0.2); color: #4ade80'
                     elif val <= 0.4:
-                        return 'background-color: #fee2e2'
-                    return 'background-color: #fef9c3'
+                        return 'background-color: rgba(239,68,68,0.2); color: #f87171'
+                    return 'background-color: rgba(234,179,8,0.15); color: #fbbf24'
 
                 def color_alpha(val):
                     if val > 0.01:
-                        return 'color: #16a34a; font-weight: bold'
+                        return 'color: #4ade80; font-weight: bold'
                     elif val < -0.01:
-                        return 'color: #dc2626; font-weight: bold'
-                    return 'color: #6b7280'
+                        return 'color: #f87171; font-weight: bold'
+                    return 'color: #9ca3af'
 
                 styled_mastery = mastery_df.style.format({
                     'theta': '{:+.3f}',
@@ -1071,8 +1067,7 @@ with tab_dashboard:
 
     st.header("Learning Velocity")
     st.caption("Velocity measures **how fast** a student is improving (or declining). "
-               "The **Ensemble** combines KT and Mastery Delta — both difficulty-aware signals — with adaptive confidence weighting. "
-               "ZPDES is shown for comparison but not used in the ensemble.")
+               "The **Ensemble** combines KT and Mastery Delta — both difficulty-aware signals — with adaptive confidence weighting.")
 
     # Ensemble first (primary metric)
     ens_mvs = result['mvs_all']['ensemble']
@@ -1089,26 +1084,40 @@ with tab_dashboard:
     ecol4.metric("V Normalized", f"{ens_mvs['velocity_normalized']:.3f}",
                  help="Velocity mapped to [0,1] for MVS calculation. 0.5 = neutral.")
 
+    with st.expander("How MVS is calculated"):
+        st.markdown(r"""
+    **Mastery-Velocity Score (MVS)** — a single 0-100 summary combining four signals:
+
+    $$\text{MVS} = 100 \times (0.40 \times M + 0.30 \times V_{\text{norm}} + 0.15 \times C + 0.15 \times B)$$
+
+    | Component | Weight | Range | Meaning |
+    |-----------|--------|-------|---------|
+    | **Mastery** ($M$) | 40% | [0, 1] | Confidence-weighted average mastery across studied subjects |
+    | **Velocity** ($V_{\text{norm}}$) | 30% | [0, 1] | Raw velocity mapped to [0,1] via sigmoid. 0.5 = neutral, >0.5 = improving |
+    | **Consistency** ($C$) | 15% | [0, 1] | Stability of velocity signal. High = steady progress, low = erratic |
+    | **Breadth** ($B$) | 15% | [0, 1] | Fraction of subjects attempted: $\min(1, n_{\text{subjects}} / n_{\text{total}})$ |
+
+    **Example:** A student with mastery=0.65, velocity_norm=0.58, consistency=0.72, breadth=0.50:
+    MVS = 100 × (0.40×0.65 + 0.30×0.58 + 0.15×0.72 + 0.15×0.50) = **62.7**
+    """)
+
     st.divider()
     st.subheader("Component Trackers")
 
     approaches = [
-        ('zpdes', 'ZPDES', '#2563eb'),
         ('kt', 'KT Logit', '#7c3aed'),
         ('mastery_delta', 'Mastery \u0394', '#0d9488'),
     ]
     approach_label_map = {k: label for k, label, _ in approaches}
     approach_label_map['ensemble'] = 'Ensemble'
 
-    cols = st.columns(3)
+    cols = st.columns(2)
     for i, (key, label, color) in enumerate(approaches):
         mvs = result['mvs_all'][key]
         with cols[i]:
             st.markdown(f"**{label}**")
             st.metric("Velocity", f"{mvs['velocity_raw']:+.4f}",
                        help={
-                           'zpdes': "ZPDES: Compares recent accuracy (adaptive window) vs older accuracy. "
-                                    "Range [-1, +1]. Self-calibrating — no model needed.",
                            'kt': "KT P(\u0394): Change in SAINT-Lite model's P(correct) between consecutive questions, "
                                         "smoothed with EMA. Uses the neural network's view of student progress.",
                            'mastery_delta': "Mastery \u0394: EMA-smoothed change in Kalman mastery per interaction. "
@@ -1137,22 +1146,22 @@ with tab_dashboard:
 
         def color_velocity(val):
             if val > 0.01:
-                return 'color: #16a34a'
+                return 'color: #4ade80'
             elif val < -0.01:
-                return 'color: #dc2626'
-            return 'color: #6b7280'
+                return 'color: #f87171'
+            return 'color: #9ca3af'
 
         styled = sdf.style.format({
             '1st Half Acc': '{:.1%}', '2nd Half Acc': '{:.1%}',
             'Actual Delta': '{:+.3f}',
-            'ZPDES': '{:+.4f}', 'KT Logit': '{:+.4f}',
+            'KT Logit': '{:+.4f}',
             'Mastery \u0394': '{:+.4f}', 'Ensemble': '{:+.4f}',
-        }).map(color_velocity, subset=['Actual Delta', 'ZPDES', 'KT Logit', 'Mastery \u0394', 'Ensemble'])
+        }).map(color_velocity, subset=['Actual Delta', 'KT Logit', 'Mastery \u0394', 'Ensemble'])
 
         st.dataframe(styled, use_container_width=True, hide_index=True)
         st.caption("**Actual Delta** = 2nd half accuracy - 1st half accuracy. "
                    "A good velocity algorithm should be positive when Actual Delta is positive, "
-                   "and negative when it's negative. ZPDES has the highest correlation (r=0.43).")
+                   "and negative when it's negative.")
     else:
         st.info("Not enough per-subject data (need >= 4 interactions per subject)")
 
@@ -1189,8 +1198,7 @@ with tab_dashboard:
     st.caption("**Ensemble** (green, solid) is the confidence-weighted combination of KT and Mastery Delta (both difficulty-aware). "
                "Component trackers shown as dotted lines: "
                "**KT Logit** (purple) tracks the SAINT-Lite model's view, "
-               "**Mastery \u0394** (teal) tracks EKF mastery changes, "
-               "**ZPDES** (blue) shown for reference but not in ensemble.")
+               "**Mastery \u0394** (teal) tracks EKF mastery changes.")
 
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1227,38 +1235,42 @@ with tab_dashboard:
     - **Mastery Delta (60%)**: EMA-smoothed change in EKF mastery (sigmoid(theta)). Uses 2PL IRT difficulty,
       discrimination, and FSRS forgetting curve. The most principled velocity signal.
 
-    CUSUM and Regression were removed: both used raw binary correctness (difficulty-unaware) and added noise
-    for stable students. ZPDES is shown for reference but not in the ensemble.
     """)
 
-    with st.expander("ZPDES Learning Progress (Clement et al., 2015)"):
+    with st.expander("Mastery Delta (60% of ensemble)"):
         st.markdown(r"""
     **Formula:**
 
-    $$LP(t) = \overline{\text{outcomes}[t-d/2 : t]} - \overline{\text{outcomes}[t-d : t-d/2]}$$
+    $$v(t) = \alpha \cdot (\text{mastery}(t) - \text{mastery}(t-1)) + (1 - \alpha) \cdot v(t-1)$$
 
-    Where $d$ is adaptive: $d = \max(16, \min(n/2, 64))$ and $n$ = total interactions for that subject.
-    Operates on **raw binary correctness** (1/0), not smoothed mastery.
+    Where $\alpha = 0.3$ (EMA smoothing) and $\text{mastery}(t) = \sigma(\theta_t)$ from the Extended Kalman Filter.
 
     **How it works:**
-    1. Maintain the full outcome history per subject
-    2. Compute adaptive window size $d$ based on how much data exists
-    3. Split last $d$ outcomes into two halves: recent $d/2$ and older $d/2$
-    4. LP = mean(recent) - mean(older)
+    1. The EKF maintains a latent ability estimate $\theta$ per topic, updated via 2PL IRT observations
+    2. After each interaction, mastery = $\sigma(\theta)$ changes based on the outcome, question difficulty,
+       and question discrimination
+    3. Take the difference in mastery between consecutive interactions for the same subject
+    4. Apply EMA smoothing to reduce noise
 
-    **Range:** [-1, +1]. Positive = improving, negative = declining.
+    **Range:** approximately [-0.07, +0.07] raw, scaled to [-1, +1] by the ensemble (SF = 15).
 
     **Worked example:**
-    Window = `[0, 1, 0, 0, 1, 0, 1, 0, | 1, 1, 0, 1, 1, 1, 0, 1]`
-    Older half mean = 3/8 = 0.375
-    Recent half mean = 6/8 = 0.750
-    **LP = 0.750 - 0.375 = +0.375** (strong improvement)
+    Polity mastery after interactions: [0.500, 0.538, 0.524, 0.561, 0.589]
+    Raw deltas: [+0.038, -0.014, +0.037, +0.028]
+    EMA (alpha=0.3): [+0.011, -0.004, +0.008, +0.014]
+    **v = +0.014** (steady improvement in EKF mastery)
 
-    **Why it works:** Self-calibrating — compares student to themselves. No model needed.
-    Subject-level correlation with actual improvement: **r = 0.43** (best among all approaches).
+    **Why it's the strongest signal:**
+    - **Difficulty-aware**: Getting a hard question wrong barely moves mastery; getting it right moves it a lot.
+      Conversely, easy questions have little impact either way. This is because the 2PL IRT observation model
+      weights updates by question discrimination and difficulty.
+    - **Forgetting-aware**: The EKF's predict step applies FSRS temporal decay. A student who hasn't practiced
+      in a while sees mastery drop, which the velocity tracker captures as negative velocity.
+    - **Uncertainty-aware**: The Kalman gain adapts — early interactions move mastery more (high uncertainty),
+      later interactions are more stable (low uncertainty). This naturally smooths the velocity signal.
     """)
 
-    with st.expander("KT Logit Derivative (zero-cost KT-based)"):
+    with st.expander("KT Logit Derivative (40% of ensemble)"):
         st.markdown(r"""
     **Formula:**
 
@@ -1293,16 +1305,15 @@ with tab_dashboard:
     st.header("Recommendation Scoring (ITZS)")
 
     st.markdown(rf"""
-    **ITZS (Information-Theoretic ZPD Scoring)** — 5 orthogonal components:
+    **ITZS (Information-Theoretic ZPD Scoring)** — 4 orthogonal components:
 
-    $$\text{{score}} = w_e \cdot \text{{ELG}} + w_r \cdot \text{{review}} + w_i \cdot \text{{info\_gain}} + w_x \cdot \text{{exam}} + w_n \cdot \text{{novelty}}$$
+    $$\text{{score}} = w_e \cdot \text{{ELG}} + w_r \cdot \text{{review}} + w_i \cdot \text{{info\_gain}} + w_n \cdot \text{{novelty}}$$
 
     | Component | Weight | Formula | Source |
     |-----------|--------|---------|--------|
     | Expected Learning Gain | {ITZS_WEIGHTS['w_elg']:.2f} | $\text{{zpd}}(P_{{kt}}) \times (1 - mastery)$ | Wilson 2019 + Clément 2015 |
     | Review Urgency | {ITZS_WEIGHTS['w_review']:.2f} | $\sigma(-{REVIEW_SIGMOID_K:.0f} \cdot (R - {REVIEW_R_THRESHOLD:.2f}))$ | FSRS v5 |
     | Information Gain | {ITZS_WEIGHTS['w_info']:.2f} | $H(P_{{kt}}) \times (1 - mastery)$ | Shannon entropy |
-    | Exam Importance | {ITZS_WEIGHTS['w_exam']:.2f} | $\text{{pyq\_weight}} \times (1 - mastery)$ | PYQ frequency |
     | Novelty Bonus | {ITZS_WEIGHTS['w_novelty']:.2f} | $\text{{zpd}}(P_{{kt}}) \times \max(0, 1 - n/{NOVELTY_DECAY_N})$ | Exploration |
 
     **ZPD score** (85% rule, Wilson et al. 2019):
@@ -1388,7 +1399,6 @@ with tab_dashboard:
                 'ZPD': ts.zpd_score_val,
                 'ELG': ts.expected_learning_gain,
                 'Info Gain': ts.information_gain_val,
-                'Exam Imp.': ts.exam_importance,
                 'Novelty': ts.novelty_bonus,
                 'Total': ts.total_score,
                 'N': ts.n_interactions,
@@ -1400,7 +1410,7 @@ with tab_dashboard:
             rec_df.style.format({
                 'Mastery': '{:.2f}', 'P(kt)': '{:.2f}', 'R': '{:.2f}',
                 'Review Urg.': '{:.3f}', 'ZPD': '{:.3f}', 'ELG': '{:.3f}',
-                'Info Gain': '{:.3f}', 'Exam Imp.': '{:.3f}', 'Novelty': '{:.3f}',
+                'Info Gain': '{:.3f}', 'Novelty': '{:.3f}',
                 'Total': '{:.3f}',
             }).background_gradient(subset=['Total'], cmap='YlOrRd'),
             use_container_width=True, hide_index=True,
@@ -1453,14 +1463,13 @@ with tab_dashboard:
             taxonomy, user_idx_to_id, tuple(sorted(test_user_idxs)))
 
         approach_labels = {
-            'zpdes': 'ZPDES (adaptive)',
             'kt': 'KT Logit Deriv',
             'mastery_delta': 'Mastery Delta',
             'ensemble': 'Ensemble',
         }
 
         agg_data = []
-        for key in ['ensemble', 'zpdes', 'kt', 'mastery_delta']:
+        for key in ['ensemble', 'kt', 'mastery_delta']:
             m = metrics[key]
             sig_student = '*' if m.get('pearson_student_p', 1) < 0.05 else ''
             sig_subject = '*' if m.get('pearson_subject_p', 1) < 0.05 else ''
@@ -1660,7 +1669,7 @@ informs Polity predictions even before they attempt Polity. The model encodes th
             'log(1 + seconds)', 'log(1 + seconds)', 'log(1 + seconds)',
             'Raw [0,1], default 0.5', 'Raw [0,1], default 0.5',
             'log(1 + seconds)', 'log(1 + count)', 'log(1 + count)',
-            '-log(acc / (1-acc))', 'point-biserial corr', 'logit(subject_acc)',
+            '-log(acc / (1-acc))', 'point-biserial corr', 'EAP Bayesian (N(0,1) prior, 41 quad)',
         ],
         'Purpose': [
             'Time since last interaction (any subject) — forgetting proxy',
@@ -1694,48 +1703,26 @@ $$\text{discrimination} = r_{pb}(\text{is\_correct}, \text{user\_ability})$$
 High discrimination (> 0.5) = question cleanly separates strong from weak students.
 Low discrimination (< 0.2) = nearly random.
 
-**Student Ability:** Logit transform of the student's own running subject accuracy.
+**Student Ability (EAP):** Computed using **Expected A Posteriori** Bayesian estimation — numerical
+quadrature over a N(0,1) prior, updated incrementally after each response using 2PL item parameters.
 
-$$\text{student\_ability\_logit} = \log\left(\frac{\text{subject\_accuracy\_prior}}{1 - \text{subject\_accuracy\_prior}}\right)$$
+$$\hat{\theta}_{\text{EAP}} = \frac{\sum_q \theta_q \cdot L(\mathbf{x} \mid \theta_q) \cdot \pi(\theta_q)}{\sum_q L(\mathbf{x} \mid \theta_q) \cdot \pi(\theta_q)}$$
+
+where $L(\mathbf{x} \mid \theta_q)$ is the likelihood of the student's response history at quadrature point $\theta_q$,
+and $\pi(\theta_q)$ is the N(0,1) prior. Unlike `logit(accuracy)`, EAP correctly weights responses by question
+difficulty and discrimination, giving smooth, stable ability estimates from the first interaction.
 
 **Key insight:** Difficulty alone achieves AUC 0.717 — confirming it's a critical signal.
 On the 286-student dataset, the full GRU model without difficulty only achieved AUC 0.702.
 """)
 
-    # ── Evaluation & Overfitting ──────────────────────────────────────
+    # ── Evaluation ─────────────────────────────────────────────────────
     st.divider()
-    st.subheader("Evaluation & Overfitting")
+    st.subheader("Evaluation")
 
     st.metric("Per-Student AUC", "0.896",
               help="Average AUC computed per student on held-out test data, then averaged.")
-
-    # Mini training curve showing train vs val loss convergence
-    fig_overfit = go.Figure()
-    fig_overfit.add_trace(
-        go.Scatter(x=TRAINING_CURVE_EPOCHS, y=TRAINING_CURVE_LOSS,
-                   mode='lines+markers', name='Train Loss',
-                   line=dict(color='#ef4444', width=2),
-                   marker=dict(size=4)))
-    fig_overfit.add_trace(
-        go.Scatter(x=TRAINING_CURVE_EPOCHS, y=TRAINING_CURVE_VAL_LOSS,
-                   mode='lines+markers', name='Val Loss',
-                   line=dict(color='#2563eb', width=2),
-                   marker=dict(size=4)))
-    fig_overfit.update_layout(
-        height=350, margin=dict(t=30, b=40, l=50, r=50),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
-    fig_overfit.update_xaxes(title_text="Epoch")
-    fig_overfit.update_yaxes(title_text="Loss", range=[0.2, 0.65])
-    st.plotly_chart(fig_overfit, use_container_width=True)
-
-    st.markdown("""
-**Why overfitting is not a concern:**
-
-Training loss and validation loss track closely throughout training, converging by epoch 100.
-The narrow gap between them confirms the model generalizes well and is not memorizing
-training data. Early stopping with patience=10 picks the best checkpoint automatically.
-""")
+    st.caption("See the Training Curves section above for train/val loss convergence.")
 
     # ── Cold Start ────────────────────────────────────────────────────
     st.divider()
@@ -1961,7 +1948,7 @@ The mastery estimate feeds into:
 2. **MVS score** — Mastery-Velocity Score combines: 40% mastery level, 30% velocity,
    15% consistency, 15% breadth (how many subjects studied)
 3. **ITZS recommendations** — Expected Learning Gain, Review Urgency, Information Gain,
-   Exam Importance, and Novelty are combined to score which topic to study next
+   and Novelty are combined to score which topic to study next
 """)
 
     with st.expander("From Mastery to Velocity to Recommendations (full pipeline)", expanded=False):
@@ -2015,7 +2002,6 @@ Binary Response (correct / wrong)
   │    ELG     = ZPD(P_kt) × (1-m)     │
   │    Review  = σ(-k × (R - R₀))      │
   │    Info    = H(P_kt) × (1-m)       │
-  │    Exam    = PYQ_weight × (1-m)    │
   │    Novelty = ZPD(P_kt) × decay(n)  │
   │                                     │
   │  Total = weighted sum → rank topics │
