@@ -890,9 +890,11 @@ with tab_dashboard:
     # SECTION 2.5: Mastery State (EKF)
     # ═══════════════════════════════════════════════════════════════════════
 
-    st.header("Mastery State (Extended Kalman Filter)")
-    st.caption("The EKF tracks ability (theta) and learning rate (alpha) per subject. "
-               "Mastery = sigmoid(theta). Confidence grows with more observations and "
+    st.header("Mastery State (KT-Fused Extended Kalman Filter)")
+    st.caption("The KT-Fused EKF combines SAINT-Lite's cross-subject predictions with "
+               "the Extended Kalman Filter's per-topic ability tracking. It estimates "
+               "ability (theta) and learning rate (alpha) per subject, with "
+               "mastery = sigmoid(theta). Confidence grows with more observations and "
                "shrinks after long gaps (FSRS forgetting).")
 
     pipeline = result.get('pipeline')
