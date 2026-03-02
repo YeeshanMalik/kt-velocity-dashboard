@@ -1224,7 +1224,7 @@ with tab_dashboard:
 
     st.header("Algorithm Explanations")
 
-    with st.expander("Ensemble Velocity (Recommended)", expanded=True):
+    with st.expander("Ensemble Velocity", expanded=True):
         st.markdown(r"""
     **Formula:**
 
